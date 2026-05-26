@@ -272,14 +272,18 @@ else
       -o "$VALID_RESOLVERS" 2>/dev/null || true
     _ok "Valid resolvers: $(count_lines "$VALID_RESOLVERS")  ($(fmt_time $(elapsed $T0)))"
   elif has_opt massdns && [[ -f "$RESOLVERS" ]]; then
-    # use massdns as resolver validator
-    _info "Validating resolvers with massdns ..."
+    # use massdns to validate resolvers in parallel
+    _info "Validating resolvers with massdns (parallel) ..."
     T0=$(ts)
-    # test each resolver with a known query
-    while IFS= read -r res; do
-      result=$(dig @"$res" +time=2 +tries=1 +short google.com A 2>/dev/null | head -1)
-      [[ -n "$result" ]] && echo "$res" >> "$VALID_RESOLVERS"
-    done < "$RESOLVERS"
+    # generate test queries — one per resolver
+    awk '{print "google.com. A " $1}' "$RESOLVERS" > /tmp/resolver_test_queries.txt
+    # run massdns with all resolvers, filter those that returned valid answers
+    massdns -r "$RESOLVERS" -t A -o S --flush       /tmp/resolver_test_queries.txt 2>/dev/null       | grep -oP 'via \K[0-9.]+'       | sort -u > "$VALID_RESOLVERS" || true
+    # fallback: if massdns output format differs, just copy resolvers
+    if [[ ! -s "$VALID_RESOLVERS" ]]; then
+      _warn "massdns validation yielded no results — using resolvers as-is"
+      cp "$RESOLVERS" "$VALID_RESOLVERS"
+    fi
     sort -u "$VALID_RESOLVERS" -o "$VALID_RESOLVERS"
     _ok "Valid resolvers: $(count_lines "$VALID_RESOLVERS")  ($(fmt_time $(elapsed $T0)))"
   elif [[ -f "$RESOLVERS" ]]; then
