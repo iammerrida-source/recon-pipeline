@@ -1,0 +1,19 @@
+# Recon Pipeline — Example Scope File
+#
+# Format:
+#   domain.com          include this domain
+#   *.domain.com        wildcard (treated same as domain.com)
+#   !sub.domain.com     exclude this subdomain
+#
+# Lines starting with # are comments.
+# Blank lines are ignored.
+
+# ── In-scope ──────────────────────────────────────────
+example.com
+*.example.com
+api.example.org
+
+# ── Exclusions ────────────────────────────────────────
+!staging.example.com
+!internal.example.com
+!vpn.example.com
