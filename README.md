@@ -1,6 +1,6 @@
-# 🔍 Subdomain Recon Pipeline
+# 🔍 Subdomain Recon Pipeline v3.1
 
-A fast, modular, and saturation-driven subdomain discovery pipeline for bug bounty hunters and penetration testers.
+A saturation-driven recon pipeline for bug bounty hunters and penetration testers — from subdomain discovery through takeover checks, URL/param harvest, and attack-surface ranking.
 
 > ⚠️ **For authorized testing only.** Only use this tool on systems you own or have explicit written permission to test. The author is not responsible for any misuse or damage caused by this tool.
 
@@ -8,7 +8,7 @@ A fast, modular, and saturation-driven subdomain discovery pipeline for bug boun
 
 ## How It Works
 
-The pipeline runs in a feedback loop until it reaches **saturation** — meaning no significant new subdomains are being discovered. Each iteration builds on the previous one.
+The pipeline runs in a feedback loop until it reaches **saturation** — meaning no significant new subdomains are being discovered. After the discovery loop, v3.1 adds bounty-focused triage phases.
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -16,12 +16,12 @@ The pipeline runs in a feedback loop until it reaches **saturation** — meaning
 │            subfinder -all, amass, chaos,            │
 │            crt.sh, RapidDNS, HackerTarget, GitHub   │
 │                        ↓                            │
-│  Phase 3   Recursive Early (subfinder)              │
+│  Phase 3   Recursive Early (capped seed)            │
 │                        ↓                            │
 │  ┌─── LOOP until saturation ───────────────────┐    │
 │  │  Phase 2   Resolve + Wildcard Filter        │    │
 │  │  Phase 4   Permutation (alterx)             │    │
-│  │  Phase 5   Bruteforce (shuffledns)          │    │
+│  │  Phase 5   Bruteforce (iter 1 by default)   │    │
 │  │  Phase 6   ASN + PTR Pivot (asnmap + dnsx)  │    │
 │  │  Phase 7   TLS Scrape (tlsx)                │    │
 │  └─────────────────────────────────────────────┘    │
@@ -30,18 +30,34 @@ The pipeline runs in a feedback loop until it reaches **saturation** — meaning
 │  Phase 10  Favicon Hash → Shodan/Censys queries     │
 │  Phase 11  Cloud Asset Discovery (S3/Azure/GCP)     │
 │  Phase 12  Extract Words → Final Permutation Pass   │
-│  Phase 13  JSON Report                              │
+│  Phase 13  Takeover (CNAME + nuclei/subzy + hints)  │
+│  Phase 14  URL / Param Harvest (gau/wayback/katana) │
+│  Phase 15  Rank Surface → ranked/interesting.txt    │
+│  Phase 16  JSON Report                              │
 └─────────────────────────────────────────────────────┘
 ```
 
 **Termination condition:** new subdomains per iteration drops below threshold **OR** max iterations reached — whichever comes first.
+
+**Hunt next:** open `ranked/interesting.txt` after a run.
+
+---
+
+## What's new in v3.1
+
+- Subdomain takeover checks (`dnsx` CNAMEs, `nuclei -tags takeover`, `subzy`, dangling-provider hints)
+- URL / param harvest (`gau`, `waybackurls`, capped `katana`)
+- Attack-surface ranking so `dev` / `staging` / `admin` / `api` / `login` rise to the top
+- Recursive early capped (default 150) to avoid O(n) blowups
+- Full bruteforce only on iteration 1 by default (`--full-brute` to force every loop)
+- Parallel Azure/GCP bucket probes with a candidate cap
 
 ---
 
 ## Installation
 
 ```bash
-git clone https://github.com/iammerida/recon-pipeline
+git clone https://github.com/iammerrida-source/recon-pipeline
 cd recon-pipeline
 chmod +x install.sh recon_pipeline.sh
 ./install.sh
@@ -63,14 +79,22 @@ go install github.com/projectdiscovery/alterx/cmd/alterx@latest
 </details>
 
 <details>
-<summary>Optional tools (more coverage)</summary>
+<summary>Optional tools (more coverage + v3.1 phases)</summary>
 
 ```bash
 go install github.com/projectdiscovery/asnmap/cmd/asnmap@latest
 go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest
+go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+go install github.com/projectdiscovery/katana/cmd/katana@latest
+go install github.com/projectdiscovery/chaos-client/cmd/chaos@latest
 go install github.com/owasp-amass/amass/v4/...@master
 go install github.com/gwen001/github-subdomains@latest
-pip3 install s3scanner
+go install github.com/lc/gau/v2/cmd/gau@latest
+go install github.com/tomnomnom/waybackurls@latest
+go install github.com/tomnomnom/anew@latest
+go install github.com/PentestPad/subzy@latest
+pip3 install s3scanner uro dnsvalidator
+nuclei -update-templates
 ```
 </details>
 
@@ -124,6 +148,10 @@ wget -O ~/tools/resolvers.txt \
     --resume               resume from last checkpoint
     --no-cloud             skip cloud asset discovery
     --no-github            skip GitHub enumeration
+    --no-takeover          skip takeover checks
+    --no-urls              skip URL / param harvest
+    --no-rank              skip attack-surface ranking
+    --full-brute           bruteforce every loop iteration
 ```
 
 ---
@@ -149,28 +177,39 @@ api.example.org
 
 ```
 recon_example_com_<timestamp>/
-├── all_subdomains.txt        all discovered subdomains
-├── resolved.txt              live hosts with resolved IPs
-├── live_urls.txt             httpx enriched (title/tech/status/favicon)
-├── permutation_words.txt     accumulated word bank
-├── stats.json                machine-readable summary
-├── valid_resolvers.txt       validated resolver list
-├── passive/                  per-source passive results
-├── resolve/                  per-iteration dnsx output
-├── permutation/              alterx permutation candidates
-├── bruteforce/               shuffledns bruteforce results
-├── asn/                      ASN CIDR ranges + PTR results
-├── tls/                      tlsx certificate SAN/CN data
+├── all_subdomains.txt
+├── resolved.txt
+├── live_urls.txt
+├── permutation_words.txt
+├── stats.json
+├── valid_resolvers.txt
+├── passive/
+├── resolve/
+├── permutation/
+├── bruteforce/
+├── asn/
+├── tls/
 ├── httpx/
-│   ├── enriched.txt          full httpx output
-│   ├── favicon_hashes.txt    top favicon hashes
-│   ├── shodan_queries.txt    ready-to-paste Shodan queries
-│   └── censys_queries.txt    ready-to-paste Censys queries
+│   ├── enriched.txt
+│   ├── favicon_hashes.txt
+│   ├── shodan_queries.txt
+│   └── censys_queries.txt
 ├── cloud/
-│   ├── s3_found.txt          exposed S3 buckets
-│   ├── azure_found.txt       Azure blob storage hits
-│   └── gcp_found.txt         GCP storage hits
-└── pipeline.log              full execution log
+├── takeover/
+│   ├── findings.txt
+│   ├── cnames.txt
+│   └── dangling_cname_hints.txt
+├── urls/
+│   ├── all_urls.txt
+│   ├── params.txt
+│   └── param_names.txt
+├── ranked/
+│   ├── interesting.txt          ← start manual hunting here
+│   ├── ranked_hosts.txt
+│   ├── ranked_urls.txt
+│   └── priority_hosts_top100.txt
+├── words/
+└── pipeline.log
 ```
 
 ---
@@ -185,16 +224,17 @@ recon_example_com_<timestamp>/
   Total Subdomains:    1842
   Resolved / Live:     934
   Web Endpoints:       621
+  Takeover Hits:       2
+  URLs Harvested:      18440
+  Interesting:         96
   Word Bank:           2103 words
   Iterations:          3
-  Duration:            0h 14m 22s
+  Duration:            0h 18m 05s
 ```
 
 ---
 
 ## Methodology
-
-This pipeline implements a saturation-based discovery loop inspired by techniques used in real-world bug bounty recon:
 
 1. **Passive sources** cast a wide net without touching the target
 2. **Wildcard detection** prevents false positives from polluting the results
@@ -203,6 +243,9 @@ This pipeline implements a saturation-based discovery loop inspired by technique
 5. **TLS scraping** extracts SANs from certificates on discovered IPs
 6. **Favicon hashing** surfaces hidden infrastructure sharing the same frontend
 7. **Word bank feedback** — every iteration enriches the permutation dictionary
+8. **Takeover triage** catches dangling DNS / known fingerprintable services
+9. **URL harvest** pulls historical and crawled endpoints with parameters
+10. **Ranking** pushes high-value hosts/URLs to the front of your manual queue
 
 ---
 

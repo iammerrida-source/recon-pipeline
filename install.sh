@@ -130,6 +130,12 @@ install_go_tool asnmap            "github.com/projectdiscovery/asnmap/cmd/asnmap
 install_go_tool tlsx              "github.com/projectdiscovery/tlsx/cmd/tlsx"
 install_go_tool github-subdomains "github.com/gwen001/github-subdomains"
 install_go_tool chaos             "github.com/projectdiscovery/chaos-client/cmd/chaos"
+install_go_tool nuclei            "github.com/projectdiscovery/nuclei/v3/cmd/nuclei"
+install_go_tool katana            "github.com/projectdiscovery/katana/cmd/katana"
+install_go_tool gau               "github.com/lc/gau/v2/cmd/gau"
+install_go_tool waybackurls       "github.com/tomnomnom/waybackurls"
+install_go_tool anew              "github.com/tomnomnom/anew"
+install_go_tool subzy             "github.com/PentestPad/subzy"
 
 # amass (جدا چون سنگینه)
 if ! has amass; then
@@ -179,25 +185,41 @@ else
     warn "Failed to download resolvers — provide manually at $RESOLVERS_FILE"
 fi
 
+# nuclei templates (needed for takeover tags)
+if has nuclei; then
+  info "Updating nuclei templates ..."
+  nuclei -update-templates 2>/dev/null && ok "nuclei templates ready" || \
+    warn "nuclei template update failed — run: nuclei -update-templates"
+fi
+
+# uro is often pip-based if go install path differs
+if ! has uro; then
+  info "Installing uro via pip ..."
+  pip3 install uro --quiet 2>/dev/null && ok "uro installed" || \
+    warn "uro install failed — URL dedupe will fall back to sort -u"
+fi
+
 # ─── Permissions ──────────────────────────────────────
 chmod +x recon_pipeline.sh 2>/dev/null || true
 
 # ─── Summary ──────────────────────────────────────────
 echo ""
 echo -e "${G}${BOLD}══════════════════════════════════════${NC}"
-echo -e "${G}${BOLD}  Installation complete!${NC}"
+echo -e "${G}${BOLD}  Installation complete! (v3.1)${NC}"
 echo -e "${G}${BOLD}══════════════════════════════════════${NC}"
 echo ""
 echo -e "  Wordlist  : ${C}$JHADDIX${NC}"
 echo -e "  Resolvers : ${C}$RESOLVERS_FILE${NC}"
 echo ""
 echo -e "  Run: ${BOLD}./recon_pipeline.sh -d example.com${NC}"
+echo -e "  Then open: ${BOLD}ranked/interesting.txt${NC}"
 echo ""
 
 # final tool check
 echo -e "${Y}Tool availability:${NC}"
 for t in subfinder dnsx shuffledns httpx alterx asnmap tlsx amass chaos \
-          github-subdomains dnsvalidator s3scanner jq; do
+          github-subdomains dnsvalidator s3scanner jq nuclei subzy gau \
+          waybackurls katana uro anew; do
   has "$t" && echo -e "  ${G}✔${NC} $t" || echo -e "  ${Y}✗${NC} $t (optional)"
 done
 echo ""

@@ -1,23 +1,19 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════════════════════════
-#  recon_pipeline.sh  —  Subdomain Discovery Pipeline  v3.0
+#  recon_pipeline.sh  —  Subdomain Discovery Pipeline  v3.1
 #
-#  Improvements over v2:
-#    ✦ Resolver validation (dnsvalidator / massdns fallback)
-#    ✦ Scope file support  (multi-domain + wildcard + exclusions)
-#    ✦ Rate limiting & retry logic per tool
-#    ✦ Resume capability   (--resume flag)
-#    ✦ GitHub subdomain enumeration (github-subdomains)
-#    ✦ TLS certificate scraping (tlsx)
-#    ✦ Favicon hash pivot  (httpx -favicon → Shodan hint)
-#    ✦ Cloud asset discovery (s3scanner / cloud_enum)
-#    ✦ Structured JSON output  (jq)
-#    ✦ Per-phase timing & stats
+#  Improvements over v3.0:
+#    ✦ Subdomain takeover checks (dnsx CNAME + nuclei/subzy + dangling hints)
+#    ✦ URL / param harvest (gau, waybackurls, katana)
+#    ✦ Attack-surface ranking (dev/staging/admin/api/login first)
+#    ✦ Recursive early capped (avoids O(n) blowups)
+#    ✦ Full bruteforce only on iter 1 by default (--full-brute to force)
+#    ✦ Faster parallel Azure/GCP bucket probes
 #
 #  Phases:
 #    1.  Passive          subfinder -all, amass, chaos, crt.sh, github
 #    2.  Resolve + Wildcard Filter
-#    3.  Recursive Early  subfinder -recursive
+#    3.  Recursive Early  subfinder (capped seed)
 #    4.  Permutation      extract words → alterx
 #    5.  Bruteforce       shuffledns (jhaddix wordlist)
 #    6.  ASN + PTR Pivot  asnmap → CIDRs → dnsx -ptr
@@ -27,7 +23,10 @@
 #    10. Favicon Pivot    hash → Shodan/Censys hint
 #    11. Cloud Assets     S3/Azure/GCP enum
 #    12. Extract Words    titles → word bank → final alterx
-#    13. JSON Report
+#    13. Takeover         CNAME + nuclei/subzy + dangling hints
+#    14. URL Harvest      gau / wayback / katana → params
+#    15. Rank Surface     prioritize interesting hosts/URLs
+#    16. JSON Report
 #
 #  Usage:
 #    ./recon_pipeline.sh -d <domain>           single domain
@@ -52,6 +51,10 @@
 #        --resume           resume from last checkpoint
 #        --no-cloud         skip cloud asset discovery
 #        --no-github        skip github enumeration
+#        --no-takeover      skip takeover checks
+#        --no-urls          skip URL / param harvest
+#        --no-rank          skip attack-surface ranking
+#        --full-brute       bruteforce every loop iteration
 # ══════════════════════════════════════════════════════════════════════════
 
 set -uo pipefail
@@ -120,6 +123,13 @@ RATE_LIMIT=500
 RESUME=false
 NO_CLOUD=false
 NO_GITHUB=false
+NO_TAKEOVER=false
+NO_URLS=false
+NO_RANK=false
+FULL_BRUTE=false
+RECURSIVE_CAP=150
+CLOUD_CANDIDATE_CAP=300
+KATANA_CAP=80
 
 # ─── Parse Args ──────────────────────────────────────────────────────────
 usage() {
@@ -141,6 +151,10 @@ while [[ $# -gt 0 ]]; do
     --resume) RESUME=true; shift ;;
     --no-cloud) NO_CLOUD=true; shift ;;
     --no-github) NO_GITHUB=true; shift ;;
+    --no-takeover) NO_TAKEOVER=true; shift ;;
+    --no-urls) NO_URLS=true; shift ;;
+    --no-rank) NO_RANK=true; shift ;;
+    --full-brute) FULL_BRUTE=true; shift ;;
     -h|--help) usage ;;
     *) _warn "Unknown flag: $1"; shift ;;
   esac
@@ -175,7 +189,7 @@ PRIMARY_DOMAIN="${DOMAINS[0]}"
 # ─── Setup dirs ──────────────────────────────────────────────────────────
 OUTDIR="${OUTDIR:-recon_${PRIMARY_DOMAIN//\./_}_$(date +%Y%m%d_%H%M%S)}"
 $RESUME && [[ ! -d "$OUTDIR" ]] && die "Resume: output dir not found: $OUTDIR"
-mkdir -p "$OUTDIR"/{passive,resolve,permutation,bruteforce,asn,tls,httpx,cloud,words,checkpoints}
+mkdir -p "$OUTDIR"/{passive,resolve,permutation,bruteforce,asn,tls,httpx,cloud,words,takeover,urls,ranked,checkpoints}
 
 LOGFILE="$OUTDIR/pipeline.log"
 exec > >(tee -a "$LOGFILE") 2>&1
@@ -217,8 +231,8 @@ cat << 'SPLASH'
   ██╔████╔██║█████╗  ██████╔╝██║██║  ██║███████║
   ██║╚██╔╝██║██╔══╝  ██╔══██╗██║██║  ██║██╔══██║
   ██║ ╚═╝ ██║███████╗██║  ██║██║██████╔╝██║  ██║
-  ╚═╝     ╚═╝╚══════╝╚═╝  ╚═╝╚═╝╚═════╝ ╚═╝  ╚═╝  v3.0
-          by @iammerida  |  Passive→Resolve→TLS→Permute→Brute→Pivot
+  ╚═╝     ╚═╝╚══════╝╚═╝  ╚═╝╚═╝╚═════╝ ╚═╝  ╚═╝  v3.1
+          by @iammerida  |  Passive→Pivot→Takeover→URLs→Rank
 SPLASH
 echo -e "${NC}"
 printf "  ${BOLD}%-16s${NC} ${G}%s${NC}\n" \
@@ -229,14 +243,16 @@ printf "  ${BOLD}%-16s${NC} ${G}%s${NC}\n" \
   "Threads:"    "$THREADS" \
   "Rate limit:" "$RATE_LIMIT rps" \
   "Max Iter:"   "$MAX_ITER" \
-  "Threshold:"  "$NEW_THRESHOLD new/iter"
+  "Threshold:"  "$NEW_THRESHOLD new/iter" \
+  "RecursiveCap:" "$RECURSIVE_CAP"
 $RESUME && echo -e "  ${Y}${BOLD}RESUME MODE${NC}"
+$FULL_BRUTE && echo -e "  ${Y}${BOLD}FULL BRUTEFORCE MODE${NC}"
 echo ""
 
 # ─── Tool Check ──────────────────────────────────────────────────────────
 _banner "TOOL CHECK"
 REQUIRED=(subfinder dnsx shuffledns httpx alterx)
-OPTIONAL=(amass chaos asnmap tlsx github-subdomains dnsvalidator massdns jq s3scanner)
+OPTIONAL=(amass chaos asnmap tlsx github-subdomains dnsvalidator massdns jq s3scanner nuclei subzy gau waybackurls katana uro anew)
 AVAILABLE_OPTIONAL=()
 
 ALL_OK=true
@@ -391,11 +407,16 @@ dnsx -l "$ALL_SUBS" -silent -threads "$THREADS" \
   -o "$OUTDIR/resolve/quick_resolve.txt" 2>/dev/null || true
 
 if [[ -s "$OUTDIR/resolve/quick_resolve.txt" ]]; then
-  _info "subfinder -recursive on $(count_lines "$OUTDIR/resolve/quick_resolve.txt") hosts ..."
+  # Prefer deeper labels first, then cap — avoids O(n) death on huge passive sets
+  awk -F. '{print NF"\t"$0}' "$OUTDIR/resolve/quick_resolve.txt" \
+    | sort -nr | cut -f2- | head -n "$RECURSIVE_CAP" \
+    > "$OUTDIR/resolve/recursive_seed.txt"
+  _info "subfinder recursion on $(count_lines "$OUTDIR/resolve/recursive_seed.txt")/${RECURSIVE_CAP} capped hosts ..."
+  : > "$OUTDIR/passive/recursive.txt"
   while IFS= read -r sub; do
     subfinder -d "$sub" -silent -rate-limit "$RATE_LIMIT" \
       2>/dev/null >> "$OUTDIR/passive/recursive.txt" || true
-  done < "$OUTDIR/resolve/quick_resolve.txt"
+  done < "$OUTDIR/resolve/recursive_seed.txt"
   sort -u "$OUTDIR/passive/recursive.txt" -o "$OUTDIR/passive/recursive.txt" 2>/dev/null || true
   apply_exclusions "$OUTDIR/passive/recursive.txt"
   NEW=$(merge_new "$OUTDIR/passive/recursive.txt" "$ALL_SUBS")
@@ -500,7 +521,9 @@ while true; do
   mkdir -p "$BDIR"
 
   LIVE_COUNT=$(count_lines "$RESOLVED")
-  if [[ "$LIVE_COUNT" -lt 5000 ]]; then
+  if [[ "$ITERATION" -gt 1 && "$FULL_BRUTE" != true ]]; then
+    _warn "Skipping full bruteforce after iter 1 (pass --full-brute to force)"
+  elif [[ "$LIVE_COUNT" -lt 5000 ]]; then
     _info "shuffledns bruteforce (${LIVE_COUNT} < 5000) ..."
     for domain in "${DOMAINS[@]}"; do
       shuffledns -d "$domain" -w "$WORDLIST" \
@@ -724,20 +747,35 @@ if ! $NO_CLOUD; then
     [[ "$FOUND" -gt 0 ]] && _ok "S3 buckets found: $FOUND" || _stat "S3: none found"
   fi
 
-  # Azure blob & GCP storage (curl-based fallback)
-  _info "Checking Azure/GCP storage ..."
-  while IFS= read -r bucket; do
-    # Azure
+  # Cap + parallel Azure/GCP probes (sequential curl was painfully slow)
+  head -n "$CLOUD_CANDIDATE_CAP" "$CLOUD_DIR/bucket_candidates.txt" \
+    > "$CLOUD_DIR/bucket_candidates_capped.txt"
+  _info "Checking Azure/GCP storage (parallel, cap=${CLOUD_CANDIDATE_CAP}) ..."
+  : > "$CLOUD_DIR/azure_found.txt"
+  : > "$CLOUD_DIR/gcp_found.txt"
+  export CLOUD_DIR
+  probe_cloud_bucket() {
+    local bucket="$1" code
     code=$(curl -s -o /dev/null -w "%{http_code}" \
       --max-time 5 "https://${bucket}.blob.core.windows.net" 2>/dev/null || echo 0)
     [[ "$code" == "400" || "$code" == "200" ]] && \
       echo "AZURE: ${bucket}.blob.core.windows.net [${code}]" >> "$CLOUD_DIR/azure_found.txt"
-    # GCP
     code=$(curl -s -o /dev/null -w "%{http_code}" \
       --max-time 5 "https://storage.googleapis.com/${bucket}" 2>/dev/null || echo 0)
     [[ "$code" == "200" || "$code" == "403" ]] && \
       echo "GCP: storage.googleapis.com/${bucket} [${code}]" >> "$CLOUD_DIR/gcp_found.txt"
-  done < "$CLOUD_DIR/bucket_candidates.txt"
+  }
+  export -f probe_cloud_bucket
+  if has xargs; then
+    xargs -P 20 -I{} bash -c 'probe_cloud_bucket "$@"' _ {} \
+      < "$CLOUD_DIR/bucket_candidates_capped.txt" 2>/dev/null || true
+  else
+    while IFS= read -r bucket; do
+      probe_cloud_bucket "$bucket"
+    done < "$CLOUD_DIR/bucket_candidates_capped.txt"
+  fi
+  sort -u "$CLOUD_DIR/azure_found.txt" -o "$CLOUD_DIR/azure_found.txt" 2>/dev/null || true
+  sort -u "$CLOUD_DIR/gcp_found.txt" -o "$CLOUD_DIR/gcp_found.txt" 2>/dev/null || true
 
   AZURE_FOUND=$(count_lines "$CLOUD_DIR/azure_found.txt")
   GCP_FOUND=$(count_lines "$CLOUD_DIR/gcp_found.txt")
@@ -798,9 +836,253 @@ if [[ "$NEW_WORDS" -gt 5 ]]; then
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
-#  PHASE 13 — JSON REPORT
+#  PHASE 13 — SUBDOMAIN TAKEOVER
 # ══════════════════════════════════════════════════════════════════════════
-_phase 13 "JSON Report"
+_phase 13 "Subdomain Takeover Checks"
+T0=$(ts)
+TDIR="$OUTDIR/takeover"
+TAKEOVER_HITS="$TDIR/findings.txt"
+: > "$TAKEOVER_HITS"
+
+if $NO_TAKEOVER; then
+  _warn "Takeover checks skipped (--no-takeover)"
+else
+  _info "Collecting CNAME records ..."
+  dnsx -l "$RESOLVED" -cname -resp -silent -threads "$THREADS" \
+    $(resolvers_flag) -o "$TDIR/cnames.txt" 2>/dev/null || true
+  _stat "CNAME rows: $(count_lines "$TDIR/cnames.txt")"
+
+  # Dangling / takeover-prone CNAME hints (manual triage list)
+  _info "Fingerprinting dangling CNAME providers ..."
+  grep -Ei 'amazonaws\.com|cloudfront\.net|s3[\.-]|azure(websites|fd)\.|cloudapp\.net|trafficmanager\.net|blob\.core\.windows\.net|github\.io|herokuapp\.com|herokudns\.com|pantheonsite\.io|wpengine\.com|fastly\.net|feedproxy\.google|shopify\.com|myshopify\.com|unbouncepages\.com|bitbucket\.io|gitlab\.io|netlify\.app|vercel\.app|pages\.dev|ghost\.io|helpjuice\.com|helpscoutdocs\.com|zendesk\.com|statuspage\.io|cargocollective\.com|readme\.io|surge\.sh|webflow\.io|freelance\.de|notion\.site' \
+    "$TDIR/cnames.txt" 2>/dev/null \
+    | sort -u > "$TDIR/dangling_cname_hints.txt" || true
+  _stat "Dangling CNAME hints: $(count_lines "$TDIR/dangling_cname_hints.txt")"
+
+  if has_opt subzy; then
+    _info "subzy ..."
+    subzy run --targets "$RESOLVED" --concurrency "$THREADS" --hide_fails \
+      --output "$TDIR/subzy.json" 2>/dev/null || \
+    subzy -targets "$RESOLVED" -concurrency "$THREADS" -hide_fails \
+      -o "$TDIR/subzy.txt" 2>/dev/null || true
+    [[ -s "$TDIR/subzy.json" ]] && cat "$TDIR/subzy.json" >> "$TAKEOVER_HITS"
+    [[ -s "$TDIR/subzy.txt" ]] && cat "$TDIR/subzy.txt" >> "$TAKEOVER_HITS"
+  fi
+
+  if has_opt nuclei; then
+    _info "nuclei takeover tags ..."
+    # Prefer live web hosts; fallback to DNS hostnames
+    NUC_INPUT="$TDIR/nuclei_input.txt"
+    if [[ -s "$LIVE_URLS" ]]; then
+      awk '{print $1}' "$LIVE_URLS" | sed 's|/$||' | sort -u > "$NUC_INPUT"
+    else
+      awk '{print $1}' "$RESOLVED" | sort -u > "$NUC_INPUT"
+    fi
+    nuclei -l "$NUC_INPUT" -tags takeover -silent -nc \
+      -rate-limit "$RATE_LIMIT" \
+      -o "$TDIR/nuclei_takeover.txt" 2>/dev/null || true
+    # Also DNS takeover templates when available
+    nuclei -l "$RESOLVED" -tags dns,takeover -silent -nc \
+      -rate-limit "$RATE_LIMIT" \
+      -o "$TDIR/nuclei_dns_takeover.txt" 2>/dev/null || true
+    cat "$TDIR"/nuclei_*.txt 2>/dev/null >> "$TAKEOVER_HITS" || true
+  fi
+
+  if [[ ! -s "$TAKEOVER_HITS" && -s "$TDIR/dangling_cname_hints.txt" ]]; then
+    _warn "No scanner hits — review dangling_cname_hints.txt manually"
+  fi
+  sort -u "$TAKEOVER_HITS" -o "$TAKEOVER_HITS" 2>/dev/null || true
+  PHASE_STATS["takeover_hits"]=$(count_lines "$TAKEOVER_HITS")
+  _ok "Takeover findings: $(count_lines "$TAKEOVER_HITS")  ($(fmt_time $(elapsed $T0)))"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+#  PHASE 14 — URL / PARAM HARVEST
+# ══════════════════════════════════════════════════════════════════════════
+_phase 14 "URL / Param Harvest"
+T0=$(ts)
+UDIR="$OUTDIR/urls"
+URLS_ALL="$UDIR/all_urls.txt"
+URLS_PARAMS="$UDIR/params.txt"
+: > "$URLS_ALL"
+: > "$URLS_PARAMS"
+
+scope_url_filter() {
+  local src="$1" dst="$2"
+  : > "$dst"
+  [[ ! -s "$src" ]] && return
+  local domain
+  for domain in "${DOMAINS[@]}"; do
+    grep -Ei "https?://([^/]*\.)?${domain//./\\.}(/|$)" "$src" >> "$dst" 2>/dev/null || true
+  done
+  sort -u "$dst" -o "$dst" 2>/dev/null || true
+}
+
+if $NO_URLS; then
+  _warn "URL harvest skipped (--no-urls)"
+else
+  for domain in "${DOMAINS[@]}"; do
+    if has_opt gau; then
+      _info "gau --subs $domain ..."
+      gau --subs "$domain" 2>/dev/null >> "$UDIR/gau_raw.txt" || true
+    fi
+    if has_opt waybackurls; then
+      _info "waybackurls $domain ..."
+      echo "$domain" | waybackurls 2>/dev/null >> "$UDIR/wayback_raw.txt" || true
+    fi
+  done
+
+  # Active crawl on a capped set of live URLs (keeps noise/time sane)
+  if has_opt katana && [[ -s "$LIVE_URLS" ]]; then
+    awk '{print $1}' "$LIVE_URLS" | head -n "$KATANA_CAP" > "$UDIR/katana_seeds.txt"
+    _info "katana on $(count_lines "$UDIR/katana_seeds.txt") seeds ..."
+    katana -list "$UDIR/katana_seeds.txt" -silent -jc -d 2 -c 20 \
+      -rate-limit "$RATE_LIMIT" \
+      -o "$UDIR/katana_raw.txt" 2>/dev/null || true
+  fi
+
+  {
+    cat "$UDIR/gau_raw.txt" 2>/dev/null || true
+    cat "$UDIR/wayback_raw.txt" 2>/dev/null || true
+    cat "$UDIR/katana_raw.txt" 2>/dev/null || true
+  } > "$UDIR/urls_merged_raw.txt"
+
+  if has_opt uro; then
+    uro < "$UDIR/urls_merged_raw.txt" > "$UDIR/urls_deduped.txt" 2>/dev/null || \
+      sort -u "$UDIR/urls_merged_raw.txt" -o "$UDIR/urls_deduped.txt"
+  elif has_opt anew; then
+    sort -u "$UDIR/urls_merged_raw.txt" | anew "$UDIR/urls_deduped.txt" >/dev/null 2>&1 || \
+      sort -u "$UDIR/urls_merged_raw.txt" -o "$UDIR/urls_deduped.txt"
+  else
+    sort -u "$UDIR/urls_merged_raw.txt" -o "$UDIR/urls_deduped.txt"
+  fi
+
+  scope_url_filter "$UDIR/urls_deduped.txt" "$URLS_ALL"
+  grep -E 'https?://[^ ]+\?[^ ]+=' "$URLS_ALL" 2>/dev/null \
+    | sort -u > "$URLS_PARAMS" || true
+  # Also extract unique param names for fuzzing later
+  grep -oE '[?&][A-Za-z0-9_\-]+=|[A-Za-z0-9_\-]+=$' "$URLS_PARAMS" 2>/dev/null \
+    | tr -d '?&=' | sort -u > "$UDIR/param_names.txt" || true
+
+  PHASE_STATS["urls_all"]=$(count_lines "$URLS_ALL")
+  PHASE_STATS["urls_params"]=$(count_lines "$URLS_PARAMS")
+  _ok "URLs in-scope: $(count_lines "$URLS_ALL")  |  with params: $(count_lines "$URLS_PARAMS")  ($(fmt_time $(elapsed $T0)))"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+#  PHASE 15 — ATTACK SURFACE RANKING
+# ══════════════════════════════════════════════════════════════════════════
+_phase 15 "Attack Surface Ranking"
+T0=$(ts)
+RDIR="$OUTDIR/ranked"
+RANKED_HOSTS="$RDIR/ranked_hosts.txt"
+RANKED_URLS="$RDIR/ranked_urls.txt"
+INTERESTING="$RDIR/interesting.txt"
+: > "$RANKED_HOSTS"
+: > "$RANKED_URLS"
+: > "$INTERESTING"
+
+if $NO_RANK; then
+  _warn "Ranking skipped (--no-rank)"
+else
+  _info "Scoring live hosts / URLs for bounty-first triage ..."
+
+  # Host scoring from httpx enriched lines (url + status + title + tech)
+  if [[ -s "$LIVE_URLS" ]]; then
+    awk '
+      BEGIN {
+        IGNORECASE=1
+        kw["admin"]=25; kw["administrator"]=25; kw["api"]=20; kw["graphql"]=22
+        kw["swagger"]=22; kw["staging"]=18; kw["stage"]=18; kw["dev"]=16
+        kw["test"]=14; kw["uat"]=16; kw["qa"]=12; kw["internal"]=18
+        kw["intranet"]=18; kw["vpn"]=15; kw["portal"]=14; kw["login"]=16
+        kw["sso"]=16; kw["auth"]=16; kw["oauth"]=16; kw["jenkins"]=20
+        kw["grafana"]=18; kw["kibana"]=18; kw["phpmyadmin"]=22; kw["wp-admin"]=18
+        kw["jira"]=16; kw["confluence"]=16; kw["gitlab"]=16; kw["git"]=12
+        kw["ci"]=12; kw["cdn"]=4; kw["static"]=3; kw["img"]=2; kw["assets"]=2
+        kw["www"]=1; kw["blog"]=2; kw["shop"]=6; kw["pay"]=14; kw["billing"]=14
+        kw["account"]=12; kw["user"]=10; kw["upload"]=14; kw["file"]=10
+        kw["backup"]=18; kw["old"]=12; kw["legacy"]=14; kw["beta"]=12
+      }
+      {
+        line=$0
+        url=$1
+        score=0
+        host=url
+        sub(/^https?:\/\//,"",host)
+        sub(/\/.*/,"",host)
+        split(host, parts, ".")
+        for (i in parts) {
+          tok=parts[i]
+          if (tok in kw) score += kw[tok]
+        }
+        # status code boosts
+        if (match(line, /\[(401|403)\]/)) score += 12
+        if (match(line, /\[(500|502|503)\]/)) score += 10
+        if (match(line, /\[(200|201|204)\]/)) score += 2
+        # tech / title hints
+        if (line ~ /(swagger|graphql|jenkins|grafana|kibana|tomcat|weblogic|exchange)/) score += 15
+        if (line ~ /(login|sign in|sso|password|admin)/) score += 10
+        if (score < 1) score=1
+        printf "%05d\t%s\t%s\n", score, host, line
+      }
+    ' "$LIVE_URLS" | sort -nr > "$RANKED_HOSTS"
+  else
+    : > "$RANKED_HOSTS"
+  fi
+
+  # URL scoring (harvested) — keyword + param presence
+  if [[ -s "$URLS_ALL" ]]; then
+    awk '
+      BEGIN {
+        IGNORECASE=1
+        kw["admin"]=20; kw["api"]=18; kw["graphql"]=20; kw["swagger"]=20
+        kw["debug"]=18; kw["config"]=16; kw["staging"]=16; kw["dev"]=14
+        kw["test"]=12; kw["internal"]=16; kw["login"]=14; kw["auth"]=14
+        kw["reset"]=14; kw["token"]=14; kw["upload"]=14; kw["export"]=12
+        kw["backup"]=16; kw[".env"]=25; kw["actuator"]=18; kw["manage"]=14
+      }
+      {
+        u=$0; score=0
+        for (k in kw) if (index(tolower(u), k)) score += kw[k]
+        if (u ~ /\?/) score += 8
+        if (u ~ /(id=|user=|account=|file=|path=|url=|redirect=|next=|dest=)/) score += 12
+        if (score < 1) score=1
+        printf "%05d\t%s\n", score, u
+      }
+    ' "$URLS_ALL" | sort -nr > "$RANKED_URLS"
+  else
+    : > "$RANKED_URLS"
+  fi
+
+  {
+    echo "# Interesting hosts (score>=12)"
+    awk -F'\t' '$1+0 >= 12 {print}' "$RANKED_HOSTS" 2>/dev/null || true
+    echo ""
+    echo "# Interesting URLs (score>=16) — top 200"
+    awk -F'\t' '$1+0 >= 16 {print}' "$RANKED_URLS" 2>/dev/null | head -n 200 || true
+    echo ""
+    echo "# Takeover / dangling hints"
+    cat "$TDIR/dangling_cname_hints.txt" 2>/dev/null || true
+    cat "$TAKEOVER_HITS" 2>/dev/null || true
+  } > "$INTERESTING"
+
+  # Handy shortlist for manual hunting
+  awk -F'\t' 'NF>=2 {print $2}' "$RANKED_HOSTS" 2>/dev/null \
+    | awk 'NF' | sort -u > "$RDIR/priority_hosts.txt" || true
+  head -n 100 "$RDIR/priority_hosts.txt" > "$RDIR/priority_hosts_top100.txt" 2>/dev/null || true
+
+  PHASE_STATS["ranked_hosts"]=$(count_lines "$RANKED_HOSTS")
+  PHASE_STATS["interesting"]=$(grep -cvE '^#|^$' "$INTERESTING" 2>/dev/null || echo 0)
+  _ok "Ranked hosts: $(count_lines "$RANKED_HOSTS")  |  interesting lines: $(grep -cvE '^#|^$' "$INTERESTING" 2>/dev/null || echo 0)"
+  _stat "Start hunting from: $INTERESTING"
+  _time "$(fmt_time $(elapsed $T0))"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+#  PHASE 16 — JSON REPORT
+# ══════════════════════════════════════════════════════════════════════════
+_phase 16 "JSON Report"
 
 TOTAL_ELAPSED=$(elapsed $GLOBAL_START)
 PHASE_STATS["live_web"]=$(count_lines "$LIVE_URLS")
@@ -820,10 +1102,14 @@ if has_opt jq; then
     --argjson live_web "$(count_lines "$LIVE_URLS")" \
     --argjson word_bank "$(count_lines "$PERMWORDS")" \
     --argjson valid_resolvers "$(count_lines "$VALID_RESOLVERS")" \
-    --argjson passive "$(count_lines "$OUTDIR/passive"/*.txt 2>/dev/null | tail -1 || echo 0)" \
+    --argjson takeover_hits "$(count_lines "$TAKEOVER_HITS")" \
+    --argjson urls_all "$(count_lines "$URLS_ALL")" \
+    --argjson urls_params "$(count_lines "$URLS_PARAMS")" \
+    --argjson ranked_hosts "$(count_lines "$RANKED_HOSTS")" \
     --argjson exclusions "${#EXCLUSIONS[@]}" \
     --arg outdir "$OUTDIR" \
     --arg wordlist "$WORDLIST" \
+    --arg version "3.1" \
     '{
       meta: {
         target: $target,
@@ -831,7 +1117,8 @@ if has_opt jq; then
         timestamp: $timestamp,
         duration_seconds: $duration,
         outdir: $outdir,
-        wordlist: $wordlist
+        wordlist: $wordlist,
+        version: $version
       },
       stats: {
         iterations: $iterations,
@@ -840,13 +1127,23 @@ if has_opt jq; then
         live_web_endpoints: $live_web,
         word_bank_size: $word_bank,
         valid_resolvers: $valid_resolvers,
-        exclusion_rules: $exclusions
+        exclusion_rules: $exclusions,
+        takeover_hits: $takeover_hits,
+        urls_all: $urls_all,
+        urls_with_params: $urls_params,
+        ranked_hosts: $ranked_hosts
       },
       files: {
         all_subdomains: "all_subdomains.txt",
         resolved: "resolved.txt",
         live_urls: "live_urls.txt",
         word_bank: "permutation_words.txt",
+        takeover_findings: "takeover/findings.txt",
+        dangling_cname_hints: "takeover/dangling_cname_hints.txt",
+        all_urls: "urls/all_urls.txt",
+        params: "urls/params.txt",
+        interesting: "ranked/interesting.txt",
+        ranked_hosts: "ranked/ranked_hosts.txt",
         shodan_queries: "httpx/shodan_queries.txt",
         censys_queries: "httpx/censys_queries.txt",
         log: "pipeline.log"
@@ -858,6 +1155,7 @@ else
   cat > "$STATS_FILE" << JSONEOF
 {
   "target": "$PRIMARY_DOMAIN",
+  "version": "3.1",
   "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "duration_seconds": $TOTAL_ELAPSED,
   "stats": {
@@ -866,7 +1164,11 @@ else
     "resolved_live": $(count_lines "$RESOLVED"),
     "live_web_endpoints": $(count_lines "$LIVE_URLS"),
     "word_bank_size": $(count_lines "$PERMWORDS"),
-    "valid_resolvers": $(count_lines "$VALID_RESOLVERS")
+    "valid_resolvers": $(count_lines "$VALID_RESOLVERS"),
+    "takeover_hits": $(count_lines "$TAKEOVER_HITS"),
+    "urls_all": $(count_lines "$URLS_ALL"),
+    "urls_with_params": $(count_lines "$URLS_PARAMS"),
+    "ranked_hosts": $(count_lines "$RANKED_HOSTS")
   }
 }
 JSONEOF
@@ -884,17 +1186,24 @@ _TOTAL_SUBS=$(count_lines "$ALL_SUBS")
 _TOTAL_RES=$(count_lines "$RESOLVED")
 _TOTAL_WEB=$(count_lines "$LIVE_URLS")
 _TOTAL_WORDS=$(count_lines "$PERMWORDS")
+_TOTAL_TAKEOVER=$(count_lines "$TAKEOVER_HITS")
+_TOTAL_URLS=$(count_lines "$URLS_ALL")
+_TOTAL_INTERESTING=$(grep -cvE '^#|^$' "$INTERESTING" 2>/dev/null || echo 0)
 printf "  ${BOLD}%-24s${NC} ${G}%s${NC}\n" \
   "Target(s):"       "${DOMAINS[*]}" \
   "Total Subdomains:" "$_TOTAL_SUBS" \
   "Resolved / Live:"  "$_TOTAL_RES" \
   "Web Endpoints:"    "$_TOTAL_WEB" \
+  "Takeover Hits:"   "$_TOTAL_TAKEOVER" \
+  "URLs Harvested:"  "$_TOTAL_URLS" \
+  "Interesting:"     "$_TOTAL_INTERESTING" \
   "Word Bank:"       "$_TOTAL_WORDS words" \
   "Iterations:"      "$ITERATION" \
   "Duration:"        "$ELAPSED_FMT"
 
 echo ""
 echo -e "  ${BOLD}Output:${NC} ${C}$OUTDIR/${NC}"
+echo -e "  ${BOLD}Hunt next:${NC} ${C}$OUTDIR/ranked/interesting.txt${NC}"
 echo -e "${DIM}"
 cat << 'TREE'
     ├── all_subdomains.txt        master list (all discovered)
@@ -912,6 +1221,18 @@ cat << 'TREE'
     │   ├── shodan_queries.txt    ready-to-use Shodan queries
     │   └── censys_queries.txt    ready-to-use Censys queries
     ├── cloud/                    S3/Azure/GCP findings
+    ├── takeover/
+    │   ├── findings.txt          nuclei/subzy hits
+    │   ├── cnames.txt            CNAME map
+    │   └── dangling_cname_hints.txt
+    ├── urls/
+    │   ├── all_urls.txt          in-scope harvested URLs
+    │   ├── params.txt            URLs with parameters
+    │   └── param_names.txt       unique param names
+    ├── ranked/
+    │   ├── interesting.txt       START HERE for manual hunting
+    │   ├── ranked_hosts.txt      scored live hosts
+    │   └── ranked_urls.txt       scored harvested URLs
     ├── words/                    extracted word lists
     └── pipeline.log              full execution log
 TREE
